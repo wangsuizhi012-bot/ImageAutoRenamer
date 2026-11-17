@@ -19,7 +19,7 @@
     "_comment": "上游视觉接口（OpenAI 兼容）。base_url 留空=自动用本地 llama-server；要接云端/别的服务就填 base_url + api_key + model",
     "base_url": "http://127.0.0.1:9292/v1",
     "api_key": "",
-    "model": "vl8b",
+    "model": "ornith",
     "timeout": 90,
     "retry": 1,
     "max_concurrency": 2,
