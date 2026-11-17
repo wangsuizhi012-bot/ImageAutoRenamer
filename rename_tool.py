@@ -353,9 +353,12 @@ def run_cli(path, dry_run=False, workers=None):
             log_msg("[FAIL %d/%d] %s %s" % (done, total, it["src"], it["error"]))
             return
         tag = "DRY" if dry_run else "OK"
+        # 回调发生在识别完成时，dst 尚未分配，预览名取 base_name+原扩展名
+        name = os.path.basename(it["dst"]) if it.get("dst") else \
+            (it.get("base_name") or "") + os.path.splitext(it["src"])[1]
         log_msg("[%s %d/%d] %s -> %s  (desc: %s)" % (
             tag, done, total, os.path.basename(it["src"]),
-            os.path.basename(it.get("dst") or ""), (it.get("desc") or "")[:40]))
+            name, (it.get("desc") or "")[:40]))
 
     res = r.process([path], dry_run=dry_run,
                     max_workers=max(1, int(workers)) if workers else None,
