@@ -372,41 +372,23 @@ def run_cli(path, dry_run=False, workers=None):
     r.cache.save()
 
 
-def run_undo(dry_run=False):
-    """Reverse rename_log.txt entries (new -> original), for overseer/rollback."""
-    log_file = os.path.join(BASE_DIR, CONFIG.get("log_file", "rename_log.txt"))
-    if not os.path.exists(log_file):
-        log_msg("[UNDO] no log file: " + log_file)
+def run_undo(dry_run=False, last_n=0):
+    """Reverse rename_log.txt entries (new -> original), for overseer/rollback.
+
+    last_n>0 只回滚最近 n 条，避免误回放历史批次。
+    """
+    res = Renamer(CONFIG).undo(dry_run=dry_run, last_n=last_n)
+    if res.get("error"):
+        log_msg("[UNDO] " + res["error"])
         return
-    pairs = []
-    with open(log_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t")
-            if len(parts) >= 4 and parts[2] == "->":
-                pairs.append((parts[1], parts[3]))
-    ok = skip = fail = 0
-    for orig, new in reversed(pairs):
-        if os.path.exists(orig):
-            skip += 1
-            continue
-        if not os.path.exists(new):
-            fail += 1
-            log_msg("[UNDO-SKIP] new missing: " + new)
-            continue
-        tag = "DRY" if dry_run else "OK"
-        log_msg("[%s] %s -> %s" % (tag, os.path.basename(new), os.path.basename(orig)))
-        if not dry_run:
-            try:
-                os.rename(new, orig)
-            except Exception as e:
-                fail += 1
-                log_msg("[UNDO-FAIL] %s: %s" % (new, e))
-                continue
-        ok += 1
-    log_msg("[UNDO] restored=%d skip=%d fail=%d dry_run=%s" % (ok, skip, fail, dry_run))
+    for it in res["results"]:
+        if it["status"] in ("ok", "preview"):
+            log_msg("[%s] %s -> %s" % ("DRY" if dry_run else "OK",
+                                       os.path.basename(it["from"]), os.path.basename(it["to"])))
+        elif it["status"] in ("missing", "error"):
+            log_msg("[UNDO-FAIL] %s: %s" % (it["from"], it.get("error", "new missing")))
+    log_msg("[UNDO] restored=%d skip=%d fail=%d dry_run=%s" % (
+        res["restored"], res["skipped"], res["failed"], dry_run))
 
 
 def main():
@@ -416,10 +398,11 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="preview only, never rename")
     parser.add_argument("--workers", type=int, default=None, help="parallel workers in CLI mode (default: config api.max_concurrency)")
     parser.add_argument("--undo", action="store_true", help="reverse rename_log.txt")
+    parser.add_argument("--last-n", type=int, default=0, help="with --undo: only reverse the last N log entries (0 = all)")
     args = parser.parse_args()
 
     if args.undo:
-        run_undo(dry_run=args.dry_run)
+        run_undo(dry_run=args.dry_run, last_n=args.last_n)
         return
     if args.cli:
         run_cli(args.cli, dry_run=args.dry_run, workers=args.workers)

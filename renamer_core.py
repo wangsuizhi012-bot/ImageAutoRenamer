@@ -117,7 +117,8 @@ def clean_name(desc, max_len=60, space_to_underscore=False):
     name = ILLEGAL_CHARS.sub("", desc or "")
     name = name.strip().strip(".")
     # 视觉模型偶尔多带的前缀不该进文件名
-    for p in ("这张图片", "图片内容：", "描述：", "内容："):
+    for p in ("这张图片", "这是一张", "这是一个", "这是一幅", "展示了", "展示一个",
+              "图片内容：", "描述：", "内容："):
         if name.startswith(p):
             name = name[len(p):].lstrip("：: ")
             break
