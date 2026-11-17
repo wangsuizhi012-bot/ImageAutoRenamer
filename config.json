@@ -9,6 +9,7 @@
   "max_side": 768,
   "max_name_len": 60,
   "log_file": "rename_log.txt",
+  "pause_file": "E:\\AI\\_scripts\\gpu_pause.flag",
   "llama_server": "E:\\AI\\llama.cpp-cuda\\llama-server.exe",
   "backend_note": "默认后端为 llama-server + Qwen3-VL-8B。若 8B 加载失败/超时，可改用备选后端：llama-minicpmv-cli.exe + MiniCPM5-2B（使用方式见 README.md『备选后端切换』章节）",
   "fallback": {

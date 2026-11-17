@@ -371,6 +371,7 @@ class Renamer:
         self.max_name_len = int(self.config.get("max_name_len", 60))
         self.template = self.api["name_template"] or "{desc}"
         self.concurrency = max(1, int(self.api["max_concurrency"]))
+        self.pause_file = str(self.config.get("pause_file") or "")
         self._sem = threading.BoundedSemaphore(self.concurrency)
         self._reserved_lock = threading.Lock()
         self._reserved_map = {}
@@ -383,7 +384,13 @@ class Renamer:
         self.log_lock = threading.Lock()
 
     # -- 描述
+    def _wait_pause(self):
+        # GPU watchdog 置位 pause_file 时协作暂停（ComfyUI 占用显存期间）
+        while self.pause_file and os.path.exists(self.pause_file):
+            time.sleep(5)
+
     def describe_file(self, path, prompt=None):
+        self._wait_pause()
         t0 = time.time()
         sha = file_sha1(path)
         key = hashlib.sha1(("%s|%s|%s" % (sha, self.client.model, prompt or "")).encode()).hexdigest()
