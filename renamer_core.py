@@ -116,11 +116,15 @@ def clean_name(desc, max_len=60, space_to_underscore=False):
     """清洗 Windows 非法字符 / 首尾点空格 / 截断"""
     name = ILLEGAL_CHARS.sub("", desc or "")
     name = name.strip().strip(".")
-    # 视觉模型偶尔多带的前缀不该进文件名
-    for p in ("这张图片", "这是一张", "这是一个", "这是一幅", "展示了", "展示一个",
-              "图片内容：", "描述：", "内容："):
-        if name.startswith(p):
-            name = name[len(p):].lstrip("：: ")
+    # 视觉模型偶尔多带的前缀不该进文件名（可能叠套，如"这张图片展示了…"）
+    prefixes = ("这张图片", "这是一张", "这是一个", "这是一幅", "展示了", "展示一个",
+                "图片内容：", "描述：", "内容：")
+    while True:
+        for p in prefixes:
+            if name.startswith(p):
+                name = name[len(p):].lstrip("：: ")
+                break
+        else:
             break
     if space_to_underscore:
         name = re.sub(r"\s+", "_", name)
