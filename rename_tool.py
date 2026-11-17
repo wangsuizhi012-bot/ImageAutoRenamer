@@ -2,12 +2,9 @@
 """
 ImageAutoRenamer - 拖图识图自动改名工具
 把图片拖进窗口，本地视觉模型识别内容后自动改名。
-依赖: Python 3.11 + tkinter + tkinterdnd2 + requests + Pillow
+依赖: Python 3.11+ + tkinter + tkinterdnd2 + Pillow（识别/缓存/改名统一走 renamer_core）
 """
 
-import base64
-import io
-import json
 import os
 import re
 import subprocess
@@ -15,12 +12,16 @@ import sys
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    import requests
+    import tkinter as tk
 except ImportError:
-    requests = None
+    tk = None
+
+# 统一走核心库：并发 / 内容缓存 / 连接复用 / 上游 API 可配置都在 renamer_core 里
+from renamer_core import Renamer, VisionClient, collect_images, load_config
+from renamer_core import get_api_cfg as core_api_cfg
 
 try:
     from PIL import Image
@@ -33,119 +34,20 @@ except ImportError:
     TkinterDnD = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-
-ILLEGAL_CHARS = re.compile(r'[\\/:*?"<>|]')
-
-
-def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
 
 CONFIG = load_config()
 PORT = int(CONFIG["port"])
 SERVER_URL = f"http://127.0.0.1:{PORT}"
-SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # 全局状态
 server_proc = None          # 本工具启动的 llama-server 进程
 server_starting = False
 server_stopping = False
 pending_items = []          # [(orig_path, new_name, ext)]
-log_lock = threading.Lock()
 
 
 def log_msg(msg):
     print(msg, flush=True)
-
-
-def log_rename(orig_path, new_path):
-    """把改名记录追加写入 rename_log.txt（UTF-8）"""
-    try:
-        with log_lock:
-            log_file = os.path.join(BASE_DIR, CONFIG.get("log_file", "rename_log.txt"))
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\t{orig_path}\t->\t{new_path}\n")
-    except Exception as e:
-        log_msg(f"[日志写入失败] {e}")
-
-
-def image_to_jpeg_base64(path, max_side):
-    """把图片转为 JPEG 并压缩到最长边 max_side 内，返回 base64 字符串"""
-    img = Image.open(path)
-    img = img.convert("RGB")
-    w, h = img.size
-    max_dim = max(w, h)
-    if max_dim > max_side:
-        ratio = max_side / max_dim
-        img = img.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def call_vision_api(b64_img):
-    """调用本地 llama-server 视觉 API，返回描述文本"""
-    payload = {
-        "model": "qwen3-vl",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
-                    {"type": "text", "text": "用一句简短中文描述这张图片的主要内容，直接输出描述本身，不要任何前缀或解释"},
-                ],
-            }
-        ],
-        "max_tokens": int(CONFIG.get("max_tokens", 64)),
-        "temperature": float(CONFIG.get("temperature", 0.1)),
-    }
-    resp = requests.post(f"{SERVER_URL}/v1/chat/completions", json=payload, timeout=180)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
-
-
-def clean_name(desc, max_len):
-    """清洗 Windows 非法字符，去首尾空白，截断"""
-    name = ILLEGAL_CHARS.sub("", desc)
-    name = name.strip().strip(".")
-    if not name:
-        name = f"IMG_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    return name[:max_len]
-
-
-def unique_target_path(dir_path, base_name, ext):
-    """目标名冲突时自动追加 _1、_2 ..."""
-    candidate = os.path.join(dir_path, base_name + ext)
-    if not os.path.exists(candidate):
-        return candidate
-    i = 1
-    while True:
-        candidate = os.path.join(dir_path, f"{base_name}_{i}{ext}")
-        if not os.path.exists(candidate):
-            return candidate
-        i += 1
-
-
-def collect_images(paths):
-    """收集拖入路径中的图片文件（单文件或整个文件夹递归）"""
-    images = []
-    for p in paths:
-        p = p.strip()
-        if not p:
-            continue
-        # tkinterdnd2 在 Windows 下会带花括号，去掉
-        p = p.strip("{}")
-        if os.path.isdir(p):
-            for root, _dirs, files in os.walk(p):
-                for fn in sorted(files):
-                    if os.path.splitext(fn)[1].lower() in SUPPORTED_EXTS:
-                        images.append(os.path.join(root, fn))
-        elif os.path.isfile(p) and os.path.splitext(p)[1].lower() in SUPPORTED_EXTS:
-            images.append(p)
-    return images
 
 
 class App:
@@ -209,6 +111,14 @@ class App:
         self.root.after(0, lambda: self.set_server_ui(ok))
 
     def health_ok(self, timeout=3):
+        # 状态灯必须探活配置的上游（api.base_url），11436 只是无配置时的回退
+        try:
+            api = dict(core_api_cfg(CONFIG))
+            api["timeout"] = timeout
+            if VisionClient(api, CONFIG).health().get("ok"):
+                return True
+        except Exception:
+            pass
         try:
             req = urllib.request.Request(f"{SERVER_URL}/health", method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -224,7 +134,8 @@ class App:
             self.btn_start.config(state=tk.DISABLED, text="模型服务已就绪")
             self.btn_stop.config(state=tk.NORMAL)
             if not self.status_var.get().startswith("模型服务"):
-                self.status_var.set("模型服务已就绪（端口 %d）" % PORT)
+                upstream = core_api_cfg(CONFIG).get("base_url") or "端口 %d" % PORT
+                self.status_var.set("模型服务已就绪（%s）" % upstream)
         else:
             self.btn_start.config(state=tk.NORMAL, text="启动模型服务")
             self.btn_stop.config(state=tk.DISABLED)
@@ -341,43 +252,55 @@ class App:
         threading.Thread(target=self.recognize_worker, args=(images,), daemon=True).start()
 
     def recognize_worker(self, images):
-        """逐张识别并生成改名预览"""
+        """并发识别并生成改名预览（默认取 config.api.max_concurrency 路并发）"""
         global pending_items
         pending_items = []
-        items = []
-        for idx, img_path in enumerate(images, 1):
-            self.root.after(0, lambda i=idx, n=len(images), p=img_path:
-                            self.status_var.set(f"[{i}/{n}] 正在识别: {os.path.basename(p)}"))
+        total = len(images)
+        workers = max(1, int(core_api_cfg(CONFIG).get("max_concurrency", 4)))
+        results = {}
+        counter = {"done": 0}
+        lock = threading.Lock()
+        renamer = Renamer(CONFIG)
+
+        def work(idx, img_path):
             try:
-                b64 = image_to_jpeg_base64(img_path, int(CONFIG.get("max_side", 1024)))
-                desc = call_vision_api(b64)
+                d = renamer.describe_file(img_path)
+                return idx, img_path, renamer.render_name(d["desc"], img_path), None
             except Exception as e:
-                desc = ""
-                self.root.after(0, lambda p=img_path, err=str(e):
-                                self.listbox.insert(tk.END, f"[识别失败] {os.path.basename(p)}  {err}"))
-                log_msg(f"[识别失败] {img_path}: {e}")
-                continue
-            base_name = clean_name(desc, int(CONFIG.get("max_name_len", 60)))
-            ext = os.path.splitext(img_path)[1].lower()
-            new_path = unique_target_path(os.path.dirname(img_path), base_name, ext)
-            new_name = os.path.basename(new_path)
-            items.append((img_path, new_name, ext, new_path))
-            self.root.after(0, lambda it=(img_path, new_name):
-                            self.listbox.insert(tk.END, f"{os.path.basename(it[0])}  ->  {it[1]}"))
-        pending_items = [(p, n, e) for p, n, e, _ in items]
+                return idx, img_path, None, str(e)
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(work, i, p) for i, p in enumerate(images)]
+            for fut in as_completed(futs):
+                idx, img_path, base_name, err = fut.result()
+                with lock:
+                    counter["done"] += 1
+                    n = counter["done"]
+                if err:
+                    log_msg(f"[识别失败] {img_path}: {err}")
+                    self.root.after(0, lambda p=img_path, e=err: self.listbox.insert(
+                        tk.END, f"[识别失败] {os.path.basename(p)}  {e}"))
+                else:
+                    ext = os.path.splitext(img_path)[1].lower()
+                    results[idx] = (img_path, base_name + ext, ext)
+                    self.root.after(0, lambda p=img_path, b=base_name, x=ext: self.listbox.insert(
+                        tk.END, f"{os.path.basename(p)}  ->  {b}{x}"))
+                self.root.after(0, lambda k=n: self.status_var.set(f"[{k}/{total}] 已识别"))
+
+        items = [results[i] for i in range(total) if i in results]
+        pending_items = items
         self.root.after(0, lambda: self.status_var.set(
-            f"识别完成：{len(items)} 张可改名（失败 {len(images) - len(items)} 张）。确认后点『全部改名』或『跳过』"))
+            f"识别完成：{len(items)} 张可改名（失败 {total - len(items)} 张）。确认后点『全部改名』或『跳过』"))
         self.root.after(0, lambda: self.btn_all.config(state=tk.NORMAL))
         self.root.after(0, lambda: self.btn_skip.config(state=tk.NORMAL))
 
     # ---------- 改名执行 ----------
-    def do_rename(self, item):
+    def do_rename(self, item, renamer):
         orig, new_name, ext = item
-        orig_dir = os.path.dirname(orig)
-        new_path = unique_target_path(orig_dir, os.path.splitext(new_name)[0], ext)
+        new_path = renamer.alloc_target(orig, os.path.splitext(new_name)[0])
         try:
             os.rename(orig, new_path)
-            log_rename(orig, new_path)
+            renamer.log_rename(orig, new_path)
             return True, new_path
         except Exception as e:
             return False, str(e)
@@ -387,8 +310,9 @@ class App:
         if not pending_items:
             return
         done, failed = 0, 0
+        renamer = Renamer(CONFIG)
         for it in pending_items:
-            ok, info = self.do_rename(it)
+            ok, info = self.do_rename(it, renamer)
             if ok:
                 done += 1
                 self.root.after(0, lambda p=info: self.listbox.insert(tk.END, f"[已改名] {p}"))
@@ -414,15 +338,95 @@ class App:
         self.btn_skip.config(state=tk.DISABLED)
 
 
-def main():
-    global tk
-    import tkinter as tk
+# ---------------------------------------------------------- headless mode
 
+
+def run_cli(path, dry_run=False, workers=None):
+    """Headless batch mode: 复用 core（并发识别 + 内容缓存 + 结构化结果）。
+
+    Usable by workflow runners / emp_runner as the worker node, no GUI.
+    """
+    r = Renamer(load_config())
+
+    def progress(it, done, total):
+        if it.get("error") and it.get("status") in ("error", "rename_failed"):
+            log_msg("[FAIL %d/%d] %s %s" % (done, total, it["src"], it["error"]))
+            return
+        tag = "DRY" if dry_run else "OK"
+        log_msg("[%s %d/%d] %s -> %s  (desc: %s)" % (
+            tag, done, total, os.path.basename(it["src"]),
+            os.path.basename(it.get("dst") or ""), (it.get("desc") or "")[:40]))
+
+    res = r.process([path], dry_run=dry_run,
+                    max_workers=max(1, int(workers)) if workers else None,
+                    on_progress=progress)
+    if not res.get("total"):
+        log_msg("[CLI] no images found: " + str(path))
+        r.cache.save()
+        return
+    log_msg("[CLI] done=%d failed=%d cached=%d elapsed=%dms dry_run=%s" % (
+        res["renamed"], res["failed"], res["cached"], res["elapsed_ms"], dry_run))
+    r.cache.save()
+
+
+def run_undo(dry_run=False):
+    """Reverse rename_log.txt entries (new -> original), for overseer/rollback."""
+    log_file = os.path.join(BASE_DIR, CONFIG.get("log_file", "rename_log.txt"))
+    if not os.path.exists(log_file):
+        log_msg("[UNDO] no log file: " + log_file)
+        return
+    pairs = []
+    with open(log_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 4 and parts[2] == "->":
+                pairs.append((parts[1], parts[3]))
+    ok = skip = fail = 0
+    for orig, new in reversed(pairs):
+        if os.path.exists(orig):
+            skip += 1
+            continue
+        if not os.path.exists(new):
+            fail += 1
+            log_msg("[UNDO-SKIP] new missing: " + new)
+            continue
+        tag = "DRY" if dry_run else "OK"
+        log_msg("[%s] %s -> %s" % (tag, os.path.basename(new), os.path.basename(orig)))
+        if not dry_run:
+            try:
+                os.rename(new, orig)
+            except Exception as e:
+                fail += 1
+                log_msg("[UNDO-FAIL] %s: %s" % (new, e))
+                continue
+        ok += 1
+    log_msg("[UNDO] restored=%d skip=%d fail=%d dry_run=%s" % (ok, skip, fail, dry_run))
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="ImageAutoRenamer: local vision model auto rename")
+    parser.add_argument("--cli", metavar="PATH", help="headless mode: process a file or folder")
+    parser.add_argument("--dry-run", action="store_true", help="preview only, never rename")
+    parser.add_argument("--workers", type=int, default=None, help="parallel workers in CLI mode (default: config api.max_concurrency)")
+    parser.add_argument("--undo", action="store_true", help="reverse rename_log.txt")
+    args = parser.parse_args()
+
+    if args.undo:
+        run_undo(dry_run=args.dry_run)
+        return
+    if args.cli:
+        run_cli(args.cli, dry_run=args.dry_run, workers=args.workers)
+        return
+
+    if tk is None:
+        log_msg("[错误] tkinter 不可用，无法启动 GUI")
+        sys.exit(1)
     if TkinterDnD is None:
         log_msg("[错误] 未安装 tkinterdnd2，请先执行: pip install tkinterdnd2")
-        sys.exit(1)
-    if requests is None:
-        log_msg("[错误] 未安装 requests，请先执行: pip install requests")
         sys.exit(1)
     if Image is None:
         log_msg("[错误] 未安装 Pillow，请先执行: pip install Pillow")

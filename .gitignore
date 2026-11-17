@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 rename_log.txt
+cache/
+uploads/
+*.bak*
